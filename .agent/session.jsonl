@@ -1,0 +1,37 @@
+{"role":"User","content":"hello","timestamp":"2026-04-26T07:13:15.940224Z"}
+{"role":"Assistant","content":"Received: \"hello\". Use `/help` for commands or `tool:<name> <args>` to run tools.","timestamp":"2026-04-26T07:13:15.941331Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-26T07:19:26.369432Z"}
+{"role":"Assistant","content":"Hi.","timestamp":"2026-04-26T07:19:28.375075Z"}
+{"role":"User","content":"what is your name?","timestamp":"2026-04-26T07:19:32.373175Z"}
+{"role":"Assistant","content":"I’m your AI coding assistant.","timestamp":"2026-04-26T07:19:33.427179Z"}
+{"role":"User","content":"what model are you using?","timestamp":"2026-04-26T07:19:50.473118Z"}
+{"role":"Assistant","content":"I’m an OpenAI assistant running in this terminal environment.","timestamp":"2026-04-26T07:19:52.499073Z"}
+{"role":"User","content":"What time is it in UTC? use tools if needed.","timestamp":"2026-04-26T07:22:33.253248Z"}
+{"role":"Assistant","content":"model error -> failed to call OpenAI API","timestamp":"2026-04-26T07:22:33.257079Z"}
+{"role":"User","content":"What time is it in UTC? use tools if needed.","timestamp":"2026-04-26T07:23:12.868989Z"}
+{"role":"Tool","content":"time ","timestamp":"2026-04-26T07:23:14.029673Z"}
+{"role":"Assistant","content":"tool:time -> 2026-04-26T07:23:14.029664+00:00","timestamp":"2026-04-26T07:23:14.030009Z"}
+{"role":"Assistant","content":"2026-04-26T07:23:14.029664+00:00","timestamp":"2026-04-26T07:23:15.641650Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-26T07:23:46.991788Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T07:23:48.031669Z"}
+{"role":"User","content":"what tools you have?","timestamp":"2026-04-26T07:23:52.881533Z"}
+{"role":"Assistant","content":"I can use these tools:\n\n- `functions.echo` — returns the same text\n- `functions.read_file` — reads a UTF-8 text file under the workspace root\n- `functions.time` — returns the current UTC timestamp\n- `multi_tool_use.parallel` — runs multiple `functions.*` tools in parallel when appropriate","timestamp":"2026-04-26T07:23:54.805067Z"}
+{"role":"User","content":"what is the weather today?","timestamp":"2026-04-26T07:32:14.274236Z"}
+{"role":"Assistant","content":"I don’t have a weather tool or internet access here, so I can’t check live weather. If you tell me your city, I can suggest how to check it quickly or help interpret a forecast.","timestamp":"2026-04-26T07:32:16.468852Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-26T07:38:54.635649Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T07:38:56.145004Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-26T10:02:09.582652Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T10:02:11.845491Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T10:27:57.610554Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T10:28:55.361395Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T10:29:15.028927Z"}
+{"role":"User","content":"hello, jarvis","timestamp":"2026-04-26T10:29:20.359138Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-26T10:29:21.453688Z"}
+{"role":"User","content":"how are you?","timestamp":"2026-04-26T10:29:32.238366Z"}
+{"role":"Assistant","content":"Doing well. How can I help?","timestamp":"2026-04-26T10:29:33.133576Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T00:48:21.640495Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T00:48:23.738873Z"}
+{"role":"User","content":"waht is hyour?","timestamp":"2026-04-27T00:48:28.627138Z"}
+{"role":"Assistant","content":"I’m not sure what you mean. Could you rephrase that?","timestamp":"2026-04-27T00:48:29.742162Z"}
+{"role":"User","content":"are you an ai agent?","timestamp":"2026-04-27T00:48:45.171876Z"}
+{"role":"Assistant","content":"Yes.","timestamp":"2026-04-27T00:48:46.950825Z"}

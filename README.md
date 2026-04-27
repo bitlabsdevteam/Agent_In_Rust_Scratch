@@ -2,34 +2,37 @@
 
 Rust scaffold for building a coding assistant agent inspired by Claude Code and OpenClaw.
 
-This init follows your wiki guidance from:
-
-- `/Users/davidbong/Documents/my_second_brain_vault/index.md`
-- `/Users/davidbong/Documents/my_second_brain_vault/README.md`
-- `wiki/entities/claude-code.md`
-- `wiki/entities/openclaw.md`
-- `wiki/concepts/coding-agent-design-space.md`
-- `wiki/analyses/building-openclaw-style-agents.md`
-
-## Current MVP
+## Current capabilities
 
 - Thin chat loop with harness-side controls
 - Append-only JSONL session memory
 - Permission gating for privileged tools
 - Tool registry with pluggable tools
-- Model-driven tool calling (OpenAI tool calls -> local tools)
-- Explicit compaction command for context management
-- OpenAI chat backend via `.env` (`OPENAI_API_KEY`)
+- SQLite event bus for inbound/outbound dispatch
+- Routing + agent-to-agent dispatch (`/route`, `/dispatch`)
+- Delivery workers for `cli`, `file`, and websocket server transport (`/ws send`, `/ws broadcast`, `/ws poll`, `/ws clients`)
+- Optional websocket auth handshake (`AUTH <token>`) via config
+- Persistent websocket session ownership + ACL controls (`/ws bind`, `/ws allow`, `/ws acl`)
+- Websocket hardening: idle timeout + ping/pong heartbeat + connection quota + token rotation (`/ws status`, `/ws rotate-token`)
+- Provider adapters (`MODEL_PROVIDER=openai|anthropic|local`)
+- Planning/evaluator contracts (`/plan <goal>`, `/plan status|resume|start|done|fail ...`)
+- Runtime config reload from `.agent/config.json` (`/reload-config`)
+- Skill loading from `.agent/skills/*.json` (`/skills`)
+- Deterministic policy engine + audit log (`/policy reload`)
+- Policy rule matchers (`exact|prefix|wildcard|regex`) and scope (`source/channel/agent`)
+- Wall-clock heartbeat scheduler daemon + manual `/tick`
+- Multi-layer prompt composition (identity/channel/skills/memory)
+- Long-term memory snapshots in SQLite with semantic/hybrid retrieval + compaction (`/memory latest`, `/memory search ...`, `/memory compact`)
+- ANN-style memory candidate indexing for larger stores (threshold-based fast path with fallback scan)
+- Retrieval diagnostics for ANN path distribution, candidate volume, latency, and maintenance lag (`/memory status`)
+- Memory health snapshot command and optional periodic snapshot logging (`/memory snapshot`, `memory_status_snapshot_interval_ticks`)
 
 ## Run
 
-Create `.env` from the example and set your key:
+Create `.env` from the example and set provider credentials:
 
 ```bash
 cp .env.example .env
-```
-
-```bash
 cargo run
 ```
 
@@ -38,24 +41,45 @@ cargo run
 - `/help`
 - `/tools`
 - `/compact`
+- `/route <source> <agent_id>`
+- `/dispatch <to_agent> <content>`
+- `/ws send <content>`
+- `/ws broadcast <content>`
+- `/ws poll`
+- `/ws clients`
+- `/ws bind <session_id> <agent_id>`
+- `/ws allow <session_id> <agent_id>`
+- `/ws acl <session_id>`
+- `/ws status`
+- `/ws rotate-token <new_token>`
+- `/reload-config`
+- `/skills [list|reload]`
+- `/policy reload`
+- `/plan <goal>`
+- `/plan status <plan_id>`
+- `/plan resume <plan_id>`
+- `/plan start <plan_id> <step_id>`
+- `/plan done <plan_id> <step_id>`
+- `/plan fail <plan_id> <step_id> <reason>`
+- `/tick`
+- `/post <cli|file|websocket> <content>`
+- `/memory latest`
+- `/memory search <query>`
+- `/memory compact`
+- `/memory maintain`
+- `/memory status`
+- `/memory snapshot`
 - `/approve on`
 - `/approve off`
 - `/exit`
 - `tool:<name> <args>` to execute tools directly
 
-The model can also call tools automatically when needed.
+## Config files
 
-Example:
-
-```text
-tool:time
-tool:echo hello
-tool:read_file Cargo.toml
-```
+- `.agent/config.json`: runtime settings (bounds, scheduler, websocket auth/hardening, memory retention + retrieval/embedding/ANN tuning, snapshot interval, skill/policy/artifact paths)
+- `.agent/policy.json`: deterministic allow/deny rules for actions (e.g. `tool:read_file`)
+- `.agent/skills/*.json`: skill manifests
 
 ## Architecture notes
 
-See [`docs/architecture.md`](docs/architecture.md) for how this maps to your wiki's design space.
-# Agent_In_Rust_2
-# Agent_In_Rust_Scratch
-# Agent_In_Rust_Scratch
+See [`docs/architecture.md`](docs/architecture.md) for layer-by-layer mapping.

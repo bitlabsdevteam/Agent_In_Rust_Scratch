@@ -1,0 +1,3 @@
+{"action":"dispatch:default","allowed":true,"context":{"agent":"default","channel":"cli","source":"cli"},"reason":"default allow","timestamp":"2026-04-27T00:48:21.641372+00:00"}
+{"action":"dispatch:default","allowed":true,"context":{"agent":"default","channel":"cli","source":"cli"},"reason":"default allow","timestamp":"2026-04-27T00:48:28.627377+00:00"}
+{"action":"dispatch:default","allowed":true,"context":{"agent":"default","channel":"cli","source":"cli"},"reason":"default allow","timestamp":"2026-04-27T00:48:45.172147+00:00"}
