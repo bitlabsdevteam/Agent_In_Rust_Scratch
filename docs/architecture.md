@@ -33,6 +33,7 @@ This project starts with a "thin model loop + heavy harness" baseline, aligning 
 - Provider selection via `MODEL_PROVIDER`
 - Implemented adapters: `openai`, `anthropic`, `local`
 - Structured response protocol support (`text` / `tool_calls` JSON envelope)
+- OpenAI uses Responses API streaming with optional reasoning summaries and usage metrics (`reasoning_tokens`)
 
 7. Event bus + routing + dispatch (`src/agent/{events,harness,router}.rs`)
 - SQLite-backed inbound/outbound queues
@@ -40,8 +41,8 @@ This project starts with a "thin model loop + heavy harness" baseline, aligning 
 - Agent handler registry and dispatch-task handoff
 - Per-event failure isolation (failed handler does not stop queue processing)
 
-8. Channels + delivery workers + websocket transport (`src/agent/{harness,websocket}.rs`)
-- Channel targets: `cli`, `file`, `websocket`
+8. Channels + delivery workers + websocket + telegram transport (`src/agent/{harness,websocket,telegram}.rs`)
+- Channel targets: `cli`, `file`, `websocket`, `telegram`
 - Delivery worker behavior with per-channel handlers
 - Delivery failure tracking with retry-attempt metadata in SQLite
 - Real websocket server transport (bind address configurable) with per-connection session ids
@@ -51,6 +52,10 @@ This project starts with a "thin model loop + heavy harness" baseline, aligning 
 - Explicit websocket ACLs in SQLite (`websocket_session_acl`)
 - Explicit websocket broadcast command: `/ws broadcast <content>`
 - CLI websocket commands: `/ws send`, `/ws broadcast`, `/ws poll`, `/ws clients`, `/ws bind`, `/ws allow`, `/ws acl`
+- Telegram bot polling transport (`getUpdates`) + outbound send API (`sendMessage`) with runtime config
+- Persistent telegram chat owner routing in SQLite (`telegram_chats`)
+- Explicit telegram ACLs in SQLite (`telegram_chat_acl`)
+- CLI telegram commands: `/tg send`, `/tg poll`, `/tg bind`, `/tg allow`, `/tg acl`, `/tg status`
 
 9. Concurrency bounds (`src/agent/harness.rs`)
 - Bounded inbound processing per cycle (`max_inbound_events_per_cycle`)

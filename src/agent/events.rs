@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum EventSource {
     Cli,
     WebSocket,
+    Telegram,
     Scheduler,
 }
 
@@ -18,6 +19,7 @@ impl EventSource {
         match self {
             Self::Cli => "cli",
             Self::WebSocket => "websocket",
+            Self::Telegram => "telegram",
             Self::Scheduler => "scheduler",
         }
     }
@@ -26,6 +28,7 @@ impl EventSource {
         match value {
             "cli" => Ok(Self::Cli),
             "websocket" => Ok(Self::WebSocket),
+            "telegram" => Ok(Self::Telegram),
             "scheduler" => Ok(Self::Scheduler),
             _ => Err(anyhow!("unsupported event source: {value}")),
         }
@@ -37,6 +40,7 @@ pub enum DeliveryTarget {
     Cli,
     File,
     WebSocket,
+    Telegram,
 }
 
 impl DeliveryTarget {
@@ -45,6 +49,7 @@ impl DeliveryTarget {
             Self::Cli => "cli",
             Self::File => "file",
             Self::WebSocket => "websocket",
+            Self::Telegram => "telegram",
         }
     }
 
@@ -53,6 +58,7 @@ impl DeliveryTarget {
             "cli" => Ok(Self::Cli),
             "file" => Ok(Self::File),
             "websocket" => Ok(Self::WebSocket),
+            "telegram" => Ok(Self::Telegram),
             _ => Err(anyhow!("unsupported delivery target: {value}")),
         }
     }
@@ -62,6 +68,7 @@ impl DeliveryTarget {
 pub enum InboundPayload {
     UserMessage(String),
     WebSocketMessage { session_id: String, content: String },
+    TelegramMessage { chat_id: i64, content: String },
     DispatchTask(DispatchTask),
 }
 
@@ -110,6 +117,16 @@ impl InboundEvent {
         }
     }
 
+    pub fn telegram_message(chat_id: i64, content: impl Into<String>) -> Self {
+        Self {
+            source: EventSource::Telegram,
+            payload: InboundPayload::TelegramMessage {
+                chat_id,
+                content: content.into(),
+            },
+        }
+    }
+
     #[cfg(test)]
     pub fn dispatch_task(source: EventSource, task: DispatchTask) -> Self {
         Self {
@@ -124,6 +141,7 @@ pub struct OutboundEvent {
     pub target: DeliveryTarget,
     pub content: String,
     pub websocket_session_id: Option<String>,
+    pub telegram_chat_id: Option<i64>,
 }
 
 impl OutboundEvent {
@@ -132,6 +150,7 @@ impl OutboundEvent {
             target,
             content: content.into(),
             websocket_session_id: None,
+            telegram_chat_id: None,
         }
     }
 
@@ -144,6 +163,20 @@ impl OutboundEvent {
             target,
             content: content.into(),
             websocket_session_id: Some(websocket_session_id.into()),
+            telegram_chat_id: None,
+        }
+    }
+
+    pub fn with_telegram_chat(
+        target: DeliveryTarget,
+        content: impl Into<String>,
+        telegram_chat_id: i64,
+    ) -> Self {
+        Self {
+            target,
+            content: content.into(),
+            websocket_session_id: None,
+            telegram_chat_id: Some(telegram_chat_id),
         }
     }
 }
@@ -154,6 +187,8 @@ pub struct PendingOutbound {
     pub event: OutboundEvent,
     pub attempts: i64,
 }
+
+type OutboundQueueRow = (i64, String, String, Option<String>, Option<i64>, i64);
 
 #[derive(Debug)]
 pub struct EventBus {
@@ -189,6 +224,7 @@ impl EventBus {
                 target TEXT NOT NULL,
                 content_json TEXT NOT NULL,
                 websocket_session_id TEXT NULL,
+                telegram_chat_id INTEGER NULL,
                 created_at TEXT NOT NULL,
                 processed_at TEXT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -206,6 +242,18 @@ impl EventBus {
                 agent_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (session_id, agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS telegram_chats (
+                chat_id INTEGER PRIMARY KEY,
+                owner_agent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS telegram_chat_acl (
+                chat_id INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, agent_id)
             );",
         )?;
         self.migrate_outbound_events_schema()?;
@@ -238,6 +286,13 @@ impl EventBus {
             self.conn.execute(
                 "ALTER TABLE outbound_events
                  ADD COLUMN websocket_session_id TEXT NULL",
+                [],
+            )?;
+        }
+        if !self.column_exists("outbound_events", "telegram_chat_id")? {
+            self.conn.execute(
+                "ALTER TABLE outbound_events
+                 ADD COLUMN telegram_chat_id INTEGER NULL",
                 [],
             )?;
         }
@@ -305,12 +360,13 @@ impl EventBus {
     pub fn publish_outbound(&mut self, event: OutboundEvent) -> Result<()> {
         let content_json = serde_json::to_string(&event.content)?;
         self.conn.execute(
-            "INSERT INTO outbound_events (target, content_json, websocket_session_id, created_at, processed_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)",
+            "INSERT INTO outbound_events (target, content_json, websocket_session_id, telegram_chat_id, created_at, processed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             params![
                 event.target.as_str(),
                 content_json,
                 event.websocket_session_id.as_deref(),
+                event.telegram_chat_id,
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -318,10 +374,10 @@ impl EventBus {
     }
 
     pub fn next_outbound_for_delivery(&mut self) -> Result<Option<PendingOutbound>> {
-        let row: Option<(i64, String, String, Option<String>, i64)> = self
+        let row: Option<OutboundQueueRow> = self
             .conn
             .query_row(
-                "SELECT id, target, content_json, websocket_session_id, attempt_count
+                "SELECT id, target, content_json, websocket_session_id, telegram_chat_id, attempt_count
                  FROM outbound_events
                  WHERE processed_at IS NULL
                  ORDER BY id ASC
@@ -334,12 +390,15 @@ impl EventBus {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((id, target, content_json, websocket_session_id, attempts)) = row else {
+        let Some((id, target, content_json, websocket_session_id, telegram_chat_id, attempts)) =
+            row
+        else {
             return Ok(None);
         };
 
@@ -352,6 +411,7 @@ impl EventBus {
                 target,
                 content,
                 websocket_session_id,
+                telegram_chat_id,
             },
             attempts,
         }))
@@ -460,6 +520,76 @@ impl EventBus {
                  WHERE session_id = ?1 AND agent_id = ?2
                  LIMIT 1",
                 params![session_id, agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    pub fn upsert_telegram_chat_owner(&self, chat_id: i64, owner_agent_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO telegram_chats (chat_id, owner_agent_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(chat_id)
+             DO UPDATE SET owner_agent_id = excluded.owner_agent_id, updated_at = excluded.updated_at",
+            params![chat_id, owner_agent_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn telegram_chat_owner(&self, chat_id: i64) -> Result<Option<String>> {
+        let owner = self
+            .conn
+            .query_row(
+                "SELECT owner_agent_id FROM telegram_chats WHERE chat_id = ?1",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(owner)
+    }
+
+    pub fn allow_telegram_chat_agent(&self, chat_id: i64, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO telegram_chat_acl (chat_id, agent_id, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id, agent_id)
+             DO NOTHING",
+            params![chat_id, agent_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn telegram_chat_acl(&self, chat_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id
+             FROM telegram_chat_acl
+             WHERE chat_id = ?1
+             ORDER BY agent_id ASC",
+        )?;
+        let mut rows = stmt.query(params![chat_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    pub fn telegram_chat_agent_allowed(&self, chat_id: i64, agent_id: &str) -> Result<bool> {
+        if let Some(owner) = self.telegram_chat_owner(chat_id)? {
+            if owner == agent_id {
+                return Ok(true);
+            }
+        }
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1
+                 FROM telegram_chat_acl
+                 WHERE chat_id = ?1 AND agent_id = ?2
+                 LIMIT 1",
+                params![chat_id, agent_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -704,6 +834,39 @@ mod tests {
         bus.allow_websocket_session_agent("sess-2", "other-agent")?;
         assert!(bus.websocket_session_agent_allowed("sess-2", "other-agent")?);
         let acl = bus.websocket_session_acl("sess-2")?;
+        assert_eq!(acl, vec!["other-agent".to_string()]);
+        fs::remove_dir_all(dir).expect("failed to clean temp directory");
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_chat_owner_persists_across_reopen() -> Result<()> {
+        let dir = temp_test_dir("tg_owner_reopen");
+        let db = dir.join("events.db");
+        {
+            let bus = EventBus::open(&db)?;
+            bus.upsert_telegram_chat_owner(1001, "default")?;
+        }
+        {
+            let bus = EventBus::open(&db)?;
+            let owner = bus.telegram_chat_owner(1001)?;
+            assert_eq!(owner.as_deref(), Some("default"));
+        }
+        fs::remove_dir_all(dir).expect("failed to clean temp directory");
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_chat_acl_controls_agent_access() -> Result<()> {
+        let dir = temp_test_dir("tg_acl");
+        let db = dir.join("events.db");
+        let bus = EventBus::open(&db)?;
+        bus.upsert_telegram_chat_owner(1002, "owner-agent")?;
+        assert!(bus.telegram_chat_agent_allowed(1002, "owner-agent")?);
+        assert!(!bus.telegram_chat_agent_allowed(1002, "other-agent")?);
+        bus.allow_telegram_chat_agent(1002, "other-agent")?;
+        assert!(bus.telegram_chat_agent_allowed(1002, "other-agent")?);
+        let acl = bus.telegram_chat_acl(1002)?;
         assert_eq!(acl, vec!["other-agent".to_string()]);
         fs::remove_dir_all(dir).expect("failed to clean temp directory");
         Ok(())

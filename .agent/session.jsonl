@@ -35,3 +35,33 @@
 {"role":"Assistant","content":"I’m not sure what you mean. Could you rephrase that?","timestamp":"2026-04-27T00:48:29.742162Z"}
 {"role":"User","content":"are you an ai agent?","timestamp":"2026-04-27T00:48:45.171876Z"}
 {"role":"Assistant","content":"Yes.","timestamp":"2026-04-27T00:48:46.950825Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T00:51:05.108146Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T00:51:06.315030Z"}
+{"role":"User","content":"hello agani","timestamp":"2026-04-27T00:51:12.798867Z"}
+{"role":"Assistant","content":"Hello again.","timestamp":"2026-04-27T00:51:13.720296Z"}
+{"role":"User","content":"hello there","timestamp":"2026-04-27T00:55:51.955851Z"}
+{"role":"Assistant","content":"Hello there.","timestamp":"2026-04-27T00:55:53.739545Z"}
+{"role":"User","content":"what are you?","timestamp":"2026-04-27T00:56:03.153704Z"}
+{"role":"Assistant","content":"An AI assistant.","timestamp":"2026-04-27T00:56:04.577917Z"}
+{"role":"Assistant","content":"An AI assistant.","timestamp":"2026-04-27T01:00:45.585525Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T01:03:29.013562Z"}
+{"role":"Assistant","content":"model error -> OpenAI API error 400: {\n  \"error\": {\n    \"message\": \"Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"input[3].content[0]\",\n    \"code\": \"invalid_value\"\n  }\n}","timestamp":"2026-04-27T01:03:30.132632Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T01:05:30.319290Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T01:05:31.770079Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T01:07:43.436740Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T01:07:47.301185Z"}
+{"role":"User","content":"Iw ant to use a tool","timestamp":"2026-04-27T01:07:54.505624Z"}
+{"role":"Assistant","content":"Sure — tell me which tool and the arguments.\n\nAvailable tools:\n- `functions.echo`\n- `functions.read_file`\n- `functions.time`\n- `multi_tool_use.parallel`\n\nExamples:\n- “Use `functions.time`”\n- “Use `functions.echo` with: hello”\n- “Use `functions.read_file` with: path/to/file.txt”","timestamp":"2026-04-27T01:07:56.467216Z"}
+{"role":"User","content":"what is the weather in tokyo now","timestamp":"2026-04-27T01:08:05.457950Z"}
+{"role":"Assistant","content":"I can’t check live weather from here because I don’t have internet or a weather tool.\n\nIf you want, I can help with one of these:\n- show you how to check Tokyo weather quickly\n- help parse a weather report you paste here\n- give typical weather for Tokyo this time of year","timestamp":"2026-04-27T01:08:07.514459Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T01:11:55.496891Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T01:11:56.786354Z"}
+{"role":"User","content":"what is the weather today?","timestamp":"2026-04-27T01:12:04.069379Z"}
+{"role":"Assistant","content":"I can’t check live weather from here because I don’t have internet access or a weather tool. If you share your location, I can still help with typical seasonal weather or suggest a quick way to check it.","timestamp":"2026-04-27T01:12:06.328238Z"}
+{"role":"Assistant","content":"I can’t check live weather here. If you want, tell me your city and I can suggest the fastest way to get it.","timestamp":"2026-04-27T01:16:53.866165Z"}
+{"role":"User","content":"hello","timestamp":"2026-04-27T01:18:17.905514Z"}
+{"role":"Assistant","content":"Hello.","timestamp":"2026-04-27T01:18:19.026609Z"}
+{"role":"User","content":"what is the weather today","timestamp":"2026-04-27T01:18:25.577778Z"}
+{"role":"Assistant","content":"I can’t check live weather from here because I don’t have internet access or a weather tool. If you want, tell me your city and I can suggest the fastest way to get it.","timestamp":"2026-04-27T01:18:27.595220Z"}
+{"role":"Assistant","content":"I can’t check live weather from here because I don’t have internet access or a weather tool. If you want, tell me your city and I can suggest the fastest way to get it.","timestamp":"2026-04-27T01:23:15.717398Z"}
+{"role":"Assistant","content":"I can’t check live weather from here because I don’t have internet or a weather tool. If you want, tell me your city and I’ll suggest the quickest way to check it.","timestamp":"2026-04-27T01:34:54.674344Z"}

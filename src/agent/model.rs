@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
@@ -8,6 +11,7 @@ use serde_json::{Value, json};
 use crate::agent::tools::ToolSpec;
 use crate::agent::types::{Message, Role};
 
+#[derive(Debug, Clone)]
 pub enum ModelOutput {
     Text(String),
     ToolCalls(Vec<ModelToolCall>),
@@ -19,8 +23,45 @@ pub struct ModelToolCall {
     pub args: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelResponse {
+    pub output: ModelOutput,
+    pub reasoning_summaries: Vec<String>,
+    pub usage: Option<ModelUsage>,
+}
+
+impl ModelResponse {
+    fn from_output(output: ModelOutput) -> Self {
+        Self {
+            output,
+            reasoning_summaries: Vec::new(),
+            usage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelRuntimeEvent {
+    ReasoningSummaryDelta(String),
+    OutputTextDelta(String),
+}
+
 pub trait ModelBackend {
-    fn respond(&self, history: &[Message], tools: &[ToolSpec]) -> Result<ModelOutput>;
+    fn respond(
+        &self,
+        history: &[Message],
+        tools: &[ToolSpec],
+        cancel_requested: &AtomicBool,
+        on_event: &mut dyn FnMut(ModelRuntimeEvent),
+    ) -> Result<ModelResponse>;
 }
 
 pub enum AnyModel {
@@ -44,11 +85,17 @@ impl AnyModel {
 }
 
 impl ModelBackend for AnyModel {
-    fn respond(&self, history: &[Message], tools: &[ToolSpec]) -> Result<ModelOutput> {
+    fn respond(
+        &self,
+        history: &[Message],
+        tools: &[ToolSpec],
+        cancel_requested: &AtomicBool,
+        on_event: &mut dyn FnMut(ModelRuntimeEvent),
+    ) -> Result<ModelResponse> {
         match self {
-            Self::OpenAI(m) => m.respond(history, tools),
-            Self::Anthropic(m) => m.respond(history, tools),
-            Self::Local(m) => m.respond(history, tools),
+            Self::OpenAI(m) => m.respond(history, tools, cancel_requested, on_event),
+            Self::Anthropic(m) => m.respond(history, tools, cancel_requested, on_event),
+            Self::Local(m) => m.respond(history, tools, cancel_requested, on_event),
         }
     }
 }
@@ -59,6 +106,7 @@ pub struct OpenAIChatModel {
     model: String,
     base_url: String,
     system_prompt: String,
+    reasoning_summary: Option<String>,
 }
 
 impl OpenAIChatModel {
@@ -76,6 +124,17 @@ impl OpenAIChatModel {
             "You are a pragmatic coding assistant operating in a local terminal harness. Return tool calls via tool schema when required."
                 .to_string()
         });
+        let reasoning_summary = match env::var("OPENAI_REASONING_SUMMARY") {
+            Ok(raw) => {
+                let value = raw.trim();
+                if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            }
+            Err(_) => None,
+        };
 
         Ok(Self {
             client: Client::new(),
@@ -83,65 +142,82 @@ impl OpenAIChatModel {
             model,
             base_url,
             system_prompt,
+            reasoning_summary,
         })
     }
 }
 
 impl ModelBackend for OpenAIChatModel {
-    fn respond(&self, history: &[Message], tools: &[ToolSpec]) -> Result<ModelOutput> {
-        let mut request_messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: Some(self.system_prompt.clone()),
-        }];
+    fn respond(
+        &self,
+        history: &[Message],
+        tools: &[ToolSpec],
+        cancel_requested: &AtomicBool,
+        on_event: &mut dyn FnMut(ModelRuntimeEvent),
+    ) -> Result<ModelResponse> {
+        let mut request_messages = vec![ResponseInputMessage::new(
+            "system",
+            "input_text",
+            self.system_prompt.clone(),
+        )];
 
         for msg in history {
-            request_messages.push(ChatMessage {
-                role: map_role(&msg.role).to_string(),
-                content: Some(msg.content.clone()),
-            });
+            let role = map_input_role(&msg.role);
+            let content_type = map_input_content_type(&msg.role);
+            request_messages.push(ResponseInputMessage::new(
+                role,
+                content_type,
+                msg.content.clone(),
+            ));
         }
 
-        let tool_defs: Vec<ToolDefinition> = tools
+        let tool_defs: Vec<ResponseToolDefinition> = tools
             .iter()
-            .map(|tool| ToolDefinition {
-                r#type: "function".to_string(),
-                function: ToolFunction {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: json!({
-                        "type": "object",
-                        "properties": {
-                            "args": {
-                                "type": "string",
-                                "description": "Tool arguments serialized as one plain text string."
-                            }
-                        },
-                        "required": ["args"],
-                        "additionalProperties": false
-                    }),
-                },
+            .map(|tool| ResponseToolDefinition {
+                ty: "function".to_string(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "args": {
+                            "type": "string",
+                            "description": "Tool arguments serialized as one plain text string."
+                        }
+                    },
+                    "required": ["args"],
+                    "additionalProperties": false
+                }),
+                strict: true,
             })
             .collect();
 
-        let body = ChatCompletionRequest {
+        let body = ResponseApiRequest {
             model: self.model.clone(),
-            messages: request_messages,
-            temperature: 0.2,
+            input: request_messages,
+            stream: true,
             tools: if tool_defs.is_empty() {
                 None
             } else {
                 Some(tool_defs)
             },
+            reasoning: self
+                .reasoning_summary
+                .as_ref()
+                .map(|summary| ResponseReasoning {
+                    summary: summary.clone(),
+                }),
         };
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let response = self
             .client
             .post(url)
             .bearer_auth(&self.api_key)
+            .header("Accept", "text/event-stream")
             .json(&body)
             .send()
-            .context("failed to call OpenAI API")?;
+            .context("failed to call OpenAI Responses API")?;
 
         let status = response.status();
         if !status.is_success() {
@@ -149,32 +225,308 @@ impl ModelBackend for OpenAIChatModel {
             bail!("OpenAI API error {}: {}", status.as_u16(), text);
         }
 
-        let parsed: ChatCompletionResponse = response
-            .json()
-            .context("failed to parse OpenAI chat completion response")?;
-        let message = parsed
-            .choices
-            .first()
-            .map(|c| &c.message)
-            .context("OpenAI returned no choices")?;
+        let mut final_response: Option<Value> = None;
+        let mut final_reasoning_parts: BTreeMap<usize, String> = BTreeMap::new();
+        let mut summary_part_buffers: BTreeMap<usize, String> = BTreeMap::new();
+        let mut stream_error: Option<String> = None;
 
-        if let Some(calls) = &message.tool_calls {
-            let parsed_calls: Vec<ModelToolCall> = calls
-                .iter()
-                .map(|call| ModelToolCall {
-                    name: call.function.name.clone(),
-                    args: parse_args_field(&call.function.arguments),
-                })
-                .collect();
+        let mut reader = BufReader::new(response);
+        let mut line = String::new();
+        let mut data_lines: Vec<String> = Vec::new();
 
-            if !parsed_calls.is_empty() {
-                return Ok(ModelOutput::ToolCalls(parsed_calls));
+        loop {
+            if cancel_requested.load(Ordering::Relaxed) {
+                bail!("model call canceled by user");
+            }
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                if !data_lines.is_empty() {
+                    let payload = data_lines.join("\n");
+                    handle_responses_stream_data(
+                        payload.as_str(),
+                        &mut final_response,
+                        &mut final_reasoning_parts,
+                        &mut summary_part_buffers,
+                        &mut stream_error,
+                        on_event,
+                    )?;
+                }
+                break;
+            }
+
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if !data_lines.is_empty() {
+                    let payload = data_lines.join("\n");
+                    handle_responses_stream_data(
+                        payload.as_str(),
+                        &mut final_response,
+                        &mut final_reasoning_parts,
+                        &mut summary_part_buffers,
+                        &mut stream_error,
+                        on_event,
+                    )?;
+                    data_lines.clear();
+                }
+                continue;
+            }
+
+            if let Some(data) = trimmed.strip_prefix("data:") {
+                data_lines.push(data.trim_start().to_string());
             }
         }
 
-        let content = message.content.clone().unwrap_or_else(|| "".to_string());
-        parse_protocol_or_text(&content)
+        if let Some(err) = stream_error {
+            bail!("OpenAI Responses API stream failed: {err}");
+        }
+
+        let response_obj =
+            final_response.context("OpenAI stream ended without response.completed")?;
+        let output = parse_responses_model_output(&response_obj)?;
+        let usage = parse_responses_usage(&response_obj);
+
+        let mut reasoning_summaries: Vec<String> = final_reasoning_parts
+            .into_values()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if reasoning_summaries.is_empty() {
+            reasoning_summaries = collect_reasoning_summaries(&response_obj);
+        }
+
+        Ok(ModelResponse {
+            output,
+            reasoning_summaries,
+            usage,
+        })
     }
+}
+
+fn handle_responses_stream_data(
+    payload: &str,
+    final_response: &mut Option<Value>,
+    final_reasoning_parts: &mut BTreeMap<usize, String>,
+    summary_part_buffers: &mut BTreeMap<usize, String>,
+    stream_error: &mut Option<String>,
+    on_event: &mut dyn FnMut(ModelRuntimeEvent),
+) -> Result<()> {
+    if payload == "[DONE]" {
+        return Ok(());
+    }
+
+    let event: Value = serde_json::from_str(payload)
+        .with_context(|| format!("failed to parse Responses stream event: {payload}"))?;
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+
+    match event_type {
+        "response.completed" => {
+            *final_response = event.get("response").cloned();
+        }
+        "response.failed" => {
+            let msg = event
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown failure")
+                .to_string();
+            *stream_error = Some(msg);
+        }
+        "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                let summary_index = event
+                    .get("summary_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let entry = summary_part_buffers.entry(summary_index).or_default();
+                entry.push_str(delta);
+                on_event(ModelRuntimeEvent::ReasoningSummaryDelta(entry.clone()));
+            }
+        }
+        "response.reasoning_summary.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                let summary_index = event
+                    .get("summary_index")
+                    .or_else(|| event.get("index"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let entry = summary_part_buffers.entry(summary_index).or_default();
+                entry.push_str(delta);
+                on_event(ModelRuntimeEvent::ReasoningSummaryDelta(entry.clone()));
+            }
+        }
+        "response.reasoning_summary_part.done" => {
+            if let Some(text) = event
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(Value::as_str)
+            {
+                let summary_index = event
+                    .get("summary_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                final_reasoning_parts.insert(summary_index, text.to_string());
+                summary_part_buffers.remove(&summary_index);
+            }
+        }
+        "response.reasoning_summary.done" => {
+            if let Some(text) = event
+                .get("summary")
+                .or_else(|| event.get("text"))
+                .and_then(Value::as_str)
+            {
+                let summary_index = event
+                    .get("summary_index")
+                    .or_else(|| event.get("index"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                final_reasoning_parts.insert(summary_index, text.to_string());
+                summary_part_buffers.remove(&summary_index);
+            }
+        }
+        "response.reasoning_summary_text.done" => {
+            if let Some(text) = event.get("text").and_then(Value::as_str) {
+                let summary_index = event
+                    .get("summary_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                final_reasoning_parts.insert(summary_index, text.to_string());
+                summary_part_buffers.remove(&summary_index);
+            }
+        }
+        "response.output_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                on_event(ModelRuntimeEvent::OutputTextDelta(delta.to_string()));
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn parse_responses_model_output(response: &Value) -> Result<ModelOutput> {
+    let mut tool_calls = Vec::new();
+    if let Some(items) = response.get("output").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let args = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .map(parse_args_field)
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    tool_calls.push(ModelToolCall { name, args });
+                }
+            }
+        }
+    }
+
+    if !tool_calls.is_empty() {
+        return Ok(ModelOutput::ToolCalls(tool_calls));
+    }
+
+    let text = response
+        .get("output_text")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| collect_response_message_text(response));
+
+    parse_protocol_or_text(&text)
+}
+
+fn collect_response_message_text(response: &Value) -> String {
+    let mut chunks = Vec::new();
+    if let Some(items) = response.get("output").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            chunks.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    chunks.join("\n")
+}
+
+fn collect_reasoning_summaries(response: &Value) -> Vec<String> {
+    let mut summaries = Vec::new();
+    if let Some(items) = response.get("output").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            if let Some(text) = item.get("summary").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    summaries.push(trimmed.to_string());
+                }
+                continue;
+            }
+            if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+                for part in parts {
+                    if let Some(text) = part
+                        .get("text")
+                        .or_else(|| part.get("summary_text"))
+                        .and_then(Value::as_str)
+                    {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            summaries.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    summaries
+}
+
+fn parse_responses_usage(response: &Value) -> Option<ModelUsage> {
+    let usage = response.get("usage")?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("reasoning_tokens")
+        .or_else(|| {
+            usage
+                .get("output_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Some(ModelUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    })
 }
 
 pub struct AnthropicChatModel {
@@ -213,7 +565,13 @@ impl AnthropicChatModel {
 }
 
 impl ModelBackend for AnthropicChatModel {
-    fn respond(&self, history: &[Message], _tools: &[ToolSpec]) -> Result<ModelOutput> {
+    fn respond(
+        &self,
+        history: &[Message],
+        _tools: &[ToolSpec],
+        _cancel_requested: &AtomicBool,
+        _on_event: &mut dyn FnMut(ModelRuntimeEvent),
+    ) -> Result<ModelResponse> {
         let mut messages = Vec::new();
         for msg in history {
             let role = match msg.role {
@@ -259,7 +617,7 @@ impl ModelBackend for AnthropicChatModel {
             .map(|block| block.text.clone())
             .unwrap_or_default();
 
-        parse_protocol_or_text(&text)
+        Ok(ModelResponse::from_output(parse_protocol_or_text(&text)?))
     }
 }
 
@@ -276,7 +634,13 @@ impl LocalModel {
 }
 
 impl ModelBackend for LocalModel {
-    fn respond(&self, history: &[Message], _tools: &[ToolSpec]) -> Result<ModelOutput> {
+    fn respond(
+        &self,
+        history: &[Message],
+        _tools: &[ToolSpec],
+        _cancel_requested: &AtomicBool,
+        _on_event: &mut dyn FnMut(ModelRuntimeEvent),
+    ) -> Result<ModelResponse> {
         let last = history
             .iter()
             .rev()
@@ -289,10 +653,12 @@ impl ModelBackend for LocalModel {
             let name = parts.next().unwrap_or("").trim();
             let args = parts.next().unwrap_or("").trim();
             if !name.is_empty() {
-                return Ok(ModelOutput::ToolCalls(vec![ModelToolCall {
-                    name: name.to_string(),
-                    args: args.to_string(),
-                }]));
+                return Ok(ModelResponse::from_output(ModelOutput::ToolCalls(vec![
+                    ModelToolCall {
+                        name: name.to_string(),
+                        args: args.to_string(),
+                    },
+                ])));
             }
         }
 
@@ -301,7 +667,7 @@ impl ModelBackend for LocalModel {
         } else {
             format!("local model reply: {last}")
         };
-        Ok(ModelOutput::Text(text))
+        Ok(ModelResponse::from_output(ModelOutput::Text(text)))
     }
 }
 
@@ -371,7 +737,7 @@ fn parse_args_field(arguments: &str) -> String {
     arguments.to_string()
 }
 
-fn map_role(role: &Role) -> &'static str {
+fn map_input_role(role: &Role) -> &'static str {
     match role {
         Role::System => "system",
         Role::User => "user",
@@ -380,61 +746,65 @@ fn map_role(role: &Role) -> &'static str {
     }
 }
 
+fn map_input_content_type(role: &Role) -> &'static str {
+    match role {
+        Role::Assistant | Role::Tool => "output_text",
+        Role::System | Role::User => "input_text",
+    }
+}
+
 #[derive(Debug, Serialize)]
-struct ChatCompletionRequest {
+struct ResponseApiRequest {
     model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
+    input: Vec<ResponseInputMessage>,
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolDefinition>>,
+    tools: Option<Vec<ResponseToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponseReasoning>,
 }
 
 #[derive(Debug, Serialize)]
-struct ChatMessage {
+struct ResponseInputMessage {
+    #[serde(rename = "type")]
+    ty: String,
     role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Vec<ResponseInputText>,
+}
+
+impl ResponseInputMessage {
+    fn new(role: &str, content_type: &str, text: String) -> Self {
+        Self {
+            ty: "message".to_string(),
+            role: role.to_string(),
+            content: vec![ResponseInputText {
+                ty: content_type.to_string(),
+                text,
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
-struct ToolDefinition {
-    r#type: String,
-    function: ToolFunction,
+struct ResponseInputText {
+    #[serde(rename = "type")]
+    ty: String,
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ToolFunction {
+struct ResponseToolDefinition {
+    #[serde(rename = "type")]
+    ty: String,
     name: String,
     description: String,
     parameters: Value,
+    strict: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChoiceMessage {
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<ToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    function: CalledFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct CalledFunction {
-    name: String,
-    arguments: String,
+#[derive(Debug, Serialize)]
+struct ResponseReasoning {
+    summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,7 +821,11 @@ struct AnthropicContentBlock {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelOutput, parse_structured_protocol};
+    use serde_json::json;
+
+    use super::{
+        ModelOutput, collect_reasoning_summaries, parse_responses_usage, parse_structured_protocol,
+    };
 
     #[test]
     fn parses_structured_text_protocol() {
@@ -481,5 +855,43 @@ mod tests {
             }
             _ => panic!("expected tool calls output"),
         }
+    }
+
+    #[test]
+    fn collects_reasoning_summary_texts_from_response_output() {
+        let response = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type": "summary_text", "text": "first"},
+                        {"type": "summary_text", "text": "second"}
+                    ]
+                }
+            ]
+        });
+
+        let summaries = collect_reasoning_summaries(&response);
+        assert_eq!(summaries, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn parses_reasoning_tokens_from_usage_payload() {
+        let response = json!({
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "output_tokens_details": {
+                    "reasoning_tokens": 7
+                },
+                "total_tokens": 33
+            }
+        });
+
+        let usage = parse_responses_usage(&response).expect("usage should parse");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.reasoning_tokens, 7);
+        assert_eq!(usage.total_tokens, 33);
     }
 }

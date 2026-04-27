@@ -11,10 +11,13 @@ Rust scaffold for building a coding assistant agent inspired by Claude Code and 
 - SQLite event bus for inbound/outbound dispatch
 - Routing + agent-to-agent dispatch (`/route`, `/dispatch`)
 - Delivery workers for `cli`, `file`, and websocket server transport (`/ws send`, `/ws broadcast`, `/ws poll`, `/ws clients`)
+- Telegram Bot transport via polling + send API (`/tg send`, `/tg poll`, `/tg status`)
 - Optional websocket auth handshake (`AUTH <token>`) via config
 - Persistent websocket session ownership + ACL controls (`/ws bind`, `/ws allow`, `/ws acl`)
+- Persistent Telegram chat ownership + ACL controls (`/tg bind`, `/tg allow`, `/tg acl`)
 - Websocket hardening: idle timeout + ping/pong heartbeat + connection quota + token rotation (`/ws status`, `/ws rotate-token`)
 - Provider adapters (`MODEL_PROVIDER=openai|anthropic|local`)
+- OpenAI Responses API streaming with optional reasoning summaries + reasoning token usage metrics
 - Planning/evaluator contracts (`/plan <goal>`, `/plan status|resume|start|done|fail ...`)
 - Runtime config reload from `.agent/config.json` (`/reload-config`)
 - Skill loading from `.agent/skills/*.json` (`/skills`)
@@ -52,6 +55,12 @@ cargo run
 - `/ws acl <session_id>`
 - `/ws status`
 - `/ws rotate-token <new_token>`
+- `/tg send <chat_id> <content>`
+- `/tg poll`
+- `/tg bind <chat_id> <agent_id>`
+- `/tg allow <chat_id> <agent_id>`
+- `/tg acl <chat_id>`
+- `/tg status`
 - `/reload-config`
 - `/skills [list|reload]`
 - `/policy reload`
@@ -62,7 +71,7 @@ cargo run
 - `/plan done <plan_id> <step_id>`
 - `/plan fail <plan_id> <step_id> <reason>`
 - `/tick`
-- `/post <cli|file|websocket> <content>`
+- `/post <cli|file|websocket|telegram> <content>`
 - `/memory latest`
 - `/memory search <query>`
 - `/memory compact`
@@ -71,12 +80,42 @@ cargo run
 - `/memory snapshot`
 - `/approve on`
 - `/approve off`
+- `/thinking on`
+- `/thinking off`
 - `/exit`
 - `tool:<name> <args>` to execute tools directly
 
+## Telegram setup
+
+Telegram runtime is configured in `.agent/config.json`:
+
+```json
+{
+  "telegram_enabled": true,
+  "telegram_bot_token": "123456:your_bot_token",
+  "telegram_api_base_url": "https://api.telegram.org",
+  "telegram_poll_interval_secs": 2,
+  "telegram_poll_timeout_secs": 0,
+  "telegram_allowed_chat_ids": []
+}
+```
+
+`telegram_allowed_chat_ids` empty means all chats are allowed. Set explicit chat ids to restrict access.
+
+## OpenAI reasoning summary mode
+
+Set `OPENAI_REASONING_SUMMARY` in `.env` to enable reasoning summaries from OpenAI Responses API:
+
+- `off` (default behavior)
+- `auto`
+- `concise`
+- `detailed`
+
+When enabled, the CLI streams transient `thinking>` reasoning summary updates during inference and prints usage metrics including `reasoning_tokens`.
+
 ## Config files
 
-- `.agent/config.json`: runtime settings (bounds, scheduler, websocket auth/hardening, memory retention + retrieval/embedding/ANN tuning, snapshot interval, skill/policy/artifact paths)
+- `.agent/config.json`: runtime settings (bounds, scheduler, websocket auth/hardening, telegram runtime, memory retention + retrieval/embedding/ANN tuning, snapshot interval, skill/policy/artifact paths)
 - `.agent/policy.json`: deterministic allow/deny rules for actions (e.g. `tool:read_file`)
 - `.agent/skills/*.json`: skill manifests
 

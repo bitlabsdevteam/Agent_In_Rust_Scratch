@@ -11,6 +11,7 @@ pub mod router;
 pub mod scheduler;
 pub mod session;
 pub mod skills;
+pub mod telegram;
 pub mod tools;
 pub mod types;
 pub mod websocket;

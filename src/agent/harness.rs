@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 
@@ -17,7 +18,7 @@ use crate::agent::events::{
     OutboundEvent,
 };
 use crate::agent::memory::MemoryWorker;
-use crate::agent::model::{ModelBackend, ModelOutput};
+use crate::agent::model::{ModelBackend, ModelOutput, ModelResponse, ModelRuntimeEvent};
 use crate::agent::permissions::PermissionPolicy;
 use crate::agent::planner::PlannerEngine;
 use crate::agent::policy::{PolicyContext, PolicyEngine};
@@ -26,6 +27,7 @@ use crate::agent::router::SourceRouter;
 use crate::agent::scheduler::{SchedulerControl, SchedulerDaemon, enqueue_heartbeat};
 use crate::agent::session::SessionStore;
 use crate::agent::skills::{SkillRegistry, default_skill_dir};
+use crate::agent::telegram::{TelegramRuntime, TelegramRuntimeConfig};
 use crate::agent::tools::{ToolContext, ToolRegistry};
 use crate::agent::types::{Message, Role};
 use crate::agent::websocket::{WebSocketAuthConfig, WebSocketRuntimeConfig, WebSocketServer};
@@ -48,12 +50,14 @@ pub struct Harness<M: ModelBackend> {
     agent_handlers: HashMap<String, AgentHandler<M>>,
     file_outbox_path: PathBuf,
     websocket_outbox: VecDeque<String>,
+    telegram_outbox: VecDeque<String>,
     config_manager: ConfigManager,
     planner: PlannerEngine,
     policy_engine: PolicyEngine,
     scheduler_control: SchedulerControl,
     _scheduler_daemon: SchedulerDaemon,
     websocket_server: WebSocketServer,
+    telegram_runtime: TelegramRuntime,
     skills: SkillRegistry,
     memory_worker: MemoryWorker,
     memory_ann_backfill_batch_size: usize,
@@ -61,6 +65,9 @@ pub struct Harness<M: ModelBackend> {
     memory_status_snapshot_interval_ticks: u64,
     runtime_tick_count: u64,
     active_policy_context: ActivePolicyContext,
+    cli_reasoning_overlay: Arc<Mutex<CliReasoningOverlay>>,
+    model_busy: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -69,6 +76,136 @@ struct ActivePolicyContext {
     channel: DeliveryTarget,
     agent: String,
     websocket_session_id: Option<String>,
+    telegram_chat_id: Option<i64>,
+}
+
+struct CliReasoningOverlay {
+    enabled: bool,
+    is_tty: bool,
+    max_lines: usize,
+    rendered_lines: usize,
+    lines: VecDeque<String>,
+    working_elapsed: Option<Duration>,
+    working_tick: usize,
+}
+
+impl CliReasoningOverlay {
+    fn new(enabled: bool, max_lines: usize) -> Self {
+        Self {
+            enabled,
+            is_tty: io::stdout().is_terminal(),
+            max_lines,
+            rendered_lines: 0,
+            lines: VecDeque::new(),
+            working_elapsed: None,
+            working_tick: 0,
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> io::Result<()> {
+        if !enabled {
+            self.clear()?;
+        }
+        self.enabled = enabled;
+        Ok(())
+    }
+
+    fn push(&mut self, message: impl Into<String>) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.lines.push_back(message.into());
+        while self.lines.len() > self.max_lines {
+            self.lines.pop_front();
+        }
+        if !self.is_tty {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        if !self.is_tty || self.rendered_lines == 0 {
+            self.lines.clear();
+            self.working_elapsed = None;
+            self.working_tick = 0;
+            self.rendered_lines = 0;
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        write!(stdout, "\x1b[{}A", self.rendered_lines)?;
+        for _ in 0..self.rendered_lines {
+            write!(stdout, "\r\x1b[2K\n")?;
+        }
+        write!(stdout, "\x1b[{}A", self.rendered_lines)?;
+        stdout.flush()?;
+        self.lines.clear();
+        self.working_elapsed = None;
+        self.working_tick = 0;
+        self.rendered_lines = 0;
+        Ok(())
+    }
+
+    fn start_working(&mut self) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.working_elapsed = Some(Duration::from_secs(0));
+        self.working_tick = 0;
+        if !self.is_tty {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    fn tick_working(&mut self, elapsed: Duration) -> io::Result<()> {
+        if !self.enabled || self.working_elapsed.is_none() {
+            return Ok(());
+        }
+        self.working_elapsed = Some(elapsed);
+        self.working_tick = self.working_tick.saturating_add(1);
+        if !self.is_tty {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    fn stop_working(&mut self) -> io::Result<()> {
+        if self.working_elapsed.is_none() {
+            return Ok(());
+        }
+        self.working_elapsed = None;
+        self.working_tick = 0;
+        if !self.is_tty {
+            return Ok(());
+        }
+        self.render()
+    }
+
+    fn render(&mut self) -> io::Result<()> {
+        let previous_lines = self.rendered_lines;
+        let mut stdout = io::stdout();
+        if previous_lines > 0 {
+            write!(stdout, "\x1b[{}A", previous_lines)?;
+            for _ in 0..previous_lines {
+                write!(stdout, "\r\x1b[2K\n")?;
+            }
+            write!(stdout, "\x1b[{}A", previous_lines)?;
+        }
+
+        let total = self.lines.len();
+        for (idx, line) in self.lines.iter().enumerate() {
+            let color = reasoning_line_color_code(idx, total);
+            write!(stdout, "\r\x1b[2K\x1b[{color}m• {line}\x1b[0m\n")?;
+        }
+        if let Some(elapsed) = self.working_elapsed {
+            let line = format_working_line(elapsed, self.working_tick);
+            write!(stdout, "\r\x1b[2K\x1b[97m• {line}\x1b[0m\n")?;
+        }
+        stdout.flush()?;
+        self.rendered_lines = total + usize::from(self.working_elapsed.is_some());
+        Ok(())
+    }
 }
 
 impl<M: ModelBackend> Harness<M> {
@@ -112,6 +249,7 @@ impl<M: ModelBackend> Harness<M> {
         let scheduler_daemon =
             SchedulerDaemon::start(event_db_path.clone(), scheduler_control.clone());
         let ws_runtime = websocket_runtime_config_from_harness(&cfg);
+        let tg_runtime = telegram_runtime_config_from_harness(&cfg);
 
         let websocket_server = match WebSocketServer::start(
             cfg.websocket_bind_addr.as_str(),
@@ -127,6 +265,7 @@ impl<M: ModelBackend> Harness<M> {
                 WebSocketServer::start("127.0.0.1:0", false, WebSocketRuntimeConfig::default())?
             }
         };
+        let telegram_runtime = TelegramRuntime::start(tg_runtime)?;
 
         let mut memory_worker = MemoryWorker::open(agent_dir.join("memory.db"))?;
         memory_worker.set_retention(
@@ -167,12 +306,14 @@ impl<M: ModelBackend> Harness<M> {
             agent_handlers: HashMap::new(),
             file_outbox_path,
             websocket_outbox: VecDeque::new(),
+            telegram_outbox: VecDeque::new(),
             config_manager,
             planner,
             policy_engine,
             scheduler_control,
             _scheduler_daemon: scheduler_daemon,
             websocket_server,
+            telegram_runtime,
             skills,
             memory_worker,
             memory_ann_backfill_batch_size: cfg.memory_ann_backfill_batch_size,
@@ -184,10 +325,15 @@ impl<M: ModelBackend> Harness<M> {
                 channel: DeliveryTarget::Cli,
                 agent: "default".to_string(),
                 websocket_session_id: None,
+                telegram_chat_id: None,
             },
+            cli_reasoning_overlay: Arc::new(Mutex::new(CliReasoningOverlay::new(true, 5))),
+            model_busy: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
         };
         harness.set_source_route(&EventSource::Cli, "default");
         harness.set_source_route(&EventSource::WebSocket, "default");
+        harness.set_source_route(&EventSource::Telegram, "default");
         harness.set_source_route(&EventSource::Scheduler, "default");
         harness.register_builtin_agent_handlers();
         Ok(harness)
@@ -196,12 +342,24 @@ impl<M: ModelBackend> Harness<M> {
     pub fn run(&mut self) -> Result<()> {
         println!("Agent harness ready. Type `/help` or `/exit`.");
         let (input_tx, input_rx) = mpsc::channel::<String>();
+        let mut pending_cli_inputs: VecDeque<String> = VecDeque::new();
+        let model_busy = Arc::clone(&self.model_busy);
+        let cancel_requested = Arc::clone(&self.cancel_requested);
         thread::spawn(move || {
             loop {
                 let mut input = String::new();
                 match io::stdin().read_line(&mut input) {
                     Ok(0) => break,
                     Ok(_) => {
+                        let trimmed = input.trim().to_string();
+                        if model_busy.load(Ordering::Relaxed) && trimmed == "/cancel" {
+                            cancel_requested.store(true, Ordering::Relaxed);
+                            println!("cancel> interrupt requested");
+                            continue;
+                        }
+                        if model_busy.load(Ordering::Relaxed) && !trimmed.is_empty() {
+                            println!("queued> {trimmed}");
+                        }
                         if input_tx.send(input).is_err() {
                             break;
                         }
@@ -212,14 +370,30 @@ impl<M: ModelBackend> Harness<M> {
         });
 
         loop {
+            if !self.is_model_busy() {
+                if let Some(queued) = pending_cli_inputs.pop_front() {
+                    self.handle_runtime_input(queued.trim())?;
+                    self.reload_config_if_changed()?;
+                    continue;
+                }
+            }
+
             self.ingest_websocket_inbound_events()?;
+            self.ingest_telegram_inbound_events()?;
             self.process_inbound_events()?;
             self.flush_outbound_events()?;
             self.run_memory_maintenance_tick()?;
 
             match input_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(raw) => {
-                    self.handle_runtime_input(raw.trim())?;
+                    let trimmed = raw.trim().to_string();
+                    if self.is_model_busy() && !trimmed.is_empty() {
+                        pending_cli_inputs.push_back(trimmed.clone());
+                        self.overlay_clear()?;
+                        println!("queued> {trimmed}");
+                    } else {
+                        self.handle_runtime_input(trimmed.as_str())?;
+                    }
                     self.reload_config_if_changed()?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -241,6 +415,9 @@ impl<M: ModelBackend> Harness<M> {
             return Ok(());
         }
 
+        self.overlay_clear()?;
+        println!("{}", render_cli_chat_line("user", input));
+
         if let Some((name, args)) = parse_tool_call(input) {
             let output = self.execute_tool(name, args)?;
             self.push_message(Role::Tool, format!("{name} {args}"))?;
@@ -260,9 +437,28 @@ impl<M: ModelBackend> Harness<M> {
     }
 
     fn run_model_turn(&mut self, target: DeliveryTarget) -> Result<()> {
+        struct BusyGuard {
+            flag: Arc<AtomicBool>,
+        }
+
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                self.flag.store(false, Ordering::Relaxed);
+            }
+        }
+
+        self.model_busy.store(true, Ordering::Relaxed);
+        let _busy_guard = BusyGuard {
+            flag: Arc::clone(&self.model_busy),
+        };
+
         let max_tool_rounds = 8;
+        let cli_reasoning = target == DeliveryTarget::Cli;
 
         for _ in 0..max_tool_rounds {
+            if cli_reasoning {
+                self.overlay_push("I'm now assembling prompt context, tools, and memory.")?;
+            }
             let specs = self.tools.specs();
             let prompt_layers = PromptLayers {
                 identity: "You are a pragmatic coding assistant in a Rust CLI harness.".to_string(),
@@ -272,19 +468,79 @@ impl<M: ModelBackend> Harness<M> {
             };
             let system_prompt = assemble_prompt(&prompt_layers);
             let request_history = self.history_with_system_prompt(system_prompt);
+            self.cancel_requested.store(false, Ordering::Relaxed);
+            if cli_reasoning {
+                self.overlay_push("I'm calling the model for the next action.")?;
+                self.overlay_start_working()?;
+            }
 
-            let output = match self.model.respond(&request_history, &specs) {
+            let mut streamed_assistant = String::new();
+            let mut on_event = |event: ModelRuntimeEvent| match event {
+                ModelRuntimeEvent::ReasoningSummaryDelta(text) => {
+                    let preview = summarize_reasoning_preview(&text, 140);
+                    let _ = self.overlay_push(format!("thinking: {preview}"));
+                }
+                ModelRuntimeEvent::OutputTextDelta(delta) => {
+                    streamed_assistant.push_str(&delta);
+                    let preview = summarize_reasoning_preview(&streamed_assistant, 140);
+                    let _ = self.overlay_push(format!("drafting: {preview}"));
+                }
+            };
+
+            let working_done = Arc::new(AtomicBool::new(false));
+            let worker_join = if cli_reasoning {
+                let done = Arc::clone(&working_done);
+                let overlay = Arc::clone(&self.cli_reasoning_overlay);
+                Some(thread::spawn(move || {
+                    let started = Instant::now();
+                    while !done.load(Ordering::Relaxed) {
+                        if let Ok(mut overlay) = overlay.lock() {
+                            let _ = overlay.tick_working(started.elapsed());
+                        }
+                        thread::sleep(Duration::from_millis(220));
+                    }
+                }))
+            } else {
+                None
+            };
+
+            let response_result = self.model.respond(
+                &request_history,
+                &specs,
+                self.cancel_requested.as_ref(),
+                &mut on_event,
+            );
+            working_done.store(true, Ordering::Relaxed);
+            if let Some(join) = worker_join {
+                let _ = join.join();
+            }
+            if cli_reasoning {
+                self.overlay_stop_working()?;
+            }
+
+            let response = match response_result {
                 Ok(output) => output,
                 Err(err) => {
+                    if cli_reasoning && err.to_string().contains("canceled by user") {
+                        self.overlay_push("I stopped the current model run.")?;
+                    }
                     let reply = format!("model error -> {err}");
                     self.emit_assistant_output(target.clone(), reply)?;
                     return Ok(());
                 }
             };
 
-            match output {
+            if cli_reasoning {
+                self.emit_model_metrics(&response);
+            }
+
+            match &response.output {
                 ModelOutput::Text(reply) => {
-                    self.emit_assistant_output(target.clone(), reply)?;
+                    if cli_reasoning {
+                        self.overlay_push("I'm finalizing the response.")?;
+                    }
+                    self.emit_reasoning_summaries(&response, &target)?;
+                    self.emit_assistant_output(target.clone(), reply.clone())?;
                     return Ok(());
                 }
                 ModelOutput::ToolCalls(calls) => {
@@ -293,8 +549,20 @@ impl<M: ModelBackend> Harness<M> {
                         self.emit_assistant_output(target.clone(), reply)?;
                         return Ok(());
                     }
+                    if cli_reasoning {
+                        self.overlay_push(format!(
+                            "I'm executing {} requested tool call(s).",
+                            calls.len()
+                        ))?;
+                    }
 
                     for call in calls {
+                        if cli_reasoning {
+                            self.overlay_push(format!(
+                                "I'm running tool `{}`.",
+                                call.name.as_str()
+                            ))?;
+                        }
                         let output = self.execute_tool(call.name.as_str(), call.args.as_str())?;
                         self.push_message(Role::Tool, format!("{} {}", call.name, call.args))?;
                         let rendered = format!("tool:{} -> {}", call.name, output);
@@ -306,6 +574,80 @@ impl<M: ModelBackend> Harness<M> {
 
         let reply = "stopped after max tool-call rounds".to_string();
         self.emit_assistant_output(target, reply)?;
+        Ok(())
+    }
+
+    fn is_model_busy(&self) -> bool {
+        self.model_busy.load(Ordering::Relaxed)
+    }
+
+    fn request_cancel(&self) -> bool {
+        if !self.is_model_busy() {
+            return false;
+        }
+        self.cancel_requested.store(true, Ordering::Relaxed);
+        true
+    }
+
+    fn overlay_push(&self, message: impl Into<String>) -> Result<()> {
+        if let Ok(mut overlay) = self.cli_reasoning_overlay.lock() {
+            overlay.push(message)?;
+        }
+        Ok(())
+    }
+
+    fn overlay_clear(&self) -> Result<()> {
+        if let Ok(mut overlay) = self.cli_reasoning_overlay.lock() {
+            overlay.clear()?;
+        }
+        Ok(())
+    }
+
+    fn overlay_set_enabled(&self, enabled: bool) -> Result<()> {
+        if let Ok(mut overlay) = self.cli_reasoning_overlay.lock() {
+            overlay.set_enabled(enabled)?;
+        }
+        Ok(())
+    }
+
+    fn overlay_start_working(&self) -> Result<()> {
+        if let Ok(mut overlay) = self.cli_reasoning_overlay.lock() {
+            overlay.start_working()?;
+        }
+        Ok(())
+    }
+
+    fn overlay_stop_working(&self) -> Result<()> {
+        if let Ok(mut overlay) = self.cli_reasoning_overlay.lock() {
+            overlay.stop_working()?;
+        }
+        Ok(())
+    }
+
+    fn emit_model_metrics(&self, response: &ModelResponse) {
+        if let Some(usage) = &response.usage {
+            println!(
+                "metrics> input_tokens={} output_tokens={} reasoning_tokens={} total_tokens={}",
+                usage.input_tokens, usage.output_tokens, usage.reasoning_tokens, usage.total_tokens
+            );
+        }
+    }
+
+    fn emit_reasoning_summaries(
+        &mut self,
+        response: &ModelResponse,
+        target: &DeliveryTarget,
+    ) -> Result<()> {
+        if *target != DeliveryTarget::Cli {
+            return Ok(());
+        }
+        for summary in &response.reasoning_summaries {
+            if summary.trim().is_empty() {
+                continue;
+            }
+            let line = summarize_reasoning_preview(summary, 200);
+            println!("reasoning> {line}");
+        }
         Ok(())
     }
 
@@ -369,6 +711,7 @@ impl<M: ModelBackend> Harness<M> {
         target: DeliveryTarget,
         task: DispatchTask,
         websocket_session_id: Option<String>,
+        telegram_chat_id: Option<i64>,
     ) -> Result<()> {
         if let Some(session_id) = websocket_session_id.as_deref() {
             let owner = self.event_bus.websocket_session_owner(session_id)?;
@@ -385,6 +728,27 @@ impl<M: ModelBackend> Harness<M> {
                     format!(
                         "dispatch denied by websocket ACL: session={} agent={}",
                         session_id, task.to_agent
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+
+        if let Some(chat_id) = telegram_chat_id {
+            let owner = self.event_bus.telegram_chat_owner(chat_id)?;
+            if owner.is_none() {
+                self.event_bus
+                    .upsert_telegram_chat_owner(chat_id, task.to_agent.as_str())?;
+            }
+            let allowed = self
+                .event_bus
+                .telegram_chat_agent_allowed(chat_id, task.to_agent.as_str())?;
+            if !allowed {
+                self.emit_assistant_output(
+                    DeliveryTarget::Telegram,
+                    format!(
+                        "dispatch denied by telegram ACL: chat_id={} agent={}",
+                        chat_id, task.to_agent
                     ),
                 )?;
                 return Ok(());
@@ -421,6 +785,7 @@ impl<M: ModelBackend> Harness<M> {
             channel: target.clone(),
             agent: task.to_agent.clone(),
             websocket_session_id,
+            telegram_chat_id,
         };
         let result = handler(self, target, task);
         self.active_policy_context = previous_context;
@@ -452,6 +817,7 @@ impl<M: ModelBackend> Harness<M> {
                     target,
                     DispatchTask::new("ingress", route, content),
                     None,
+                    None,
                 )
             }
             InboundPayload::WebSocketMessage {
@@ -476,10 +842,30 @@ impl<M: ModelBackend> Harness<M> {
                     target,
                     DispatchTask::new("ingress", route, content),
                     Some(session_id),
+                    None,
+                )
+            }
+            InboundPayload::TelegramMessage { chat_id, content } => {
+                self.push_message(Role::User, content.clone())?;
+                let route = match self.event_bus.telegram_chat_owner(chat_id)? {
+                    Some(owner) => owner,
+                    None => {
+                        let owner = self.router.route(&event.source).to_string();
+                        self.event_bus
+                            .upsert_telegram_chat_owner(chat_id, owner.as_str())?;
+                        owner
+                    }
+                };
+                self.dispatch_task(
+                    &event.source,
+                    target,
+                    DispatchTask::new("ingress", route, content),
+                    None,
+                    Some(chat_id),
                 )
             }
             InboundPayload::DispatchTask(task) => {
-                self.dispatch_task(&event.source, target, task, None)
+                self.dispatch_task(&event.source, target, task, None, None)
             }
         }
     }
@@ -506,14 +892,38 @@ impl<M: ModelBackend> Harness<M> {
                 println!("Compacted in-memory history.");
                 Ok(true)
             }
-            "/approve off" => {
-                self.permissions.ask_before_privileged_tools = false;
-                println!("Privileged tool approvals disabled.");
-                Ok(true)
-            }
-            "/approve on" => {
-                self.permissions.ask_before_privileged_tools = true;
-                println!("Privileged tool approvals enabled.");
+            "/approve" => match args {
+                "off" => {
+                    self.permissions.ask_before_privileged_tools = false;
+                    println!("Privileged tool approvals disabled.");
+                    Ok(true)
+                }
+                "on" => {
+                    self.permissions.ask_before_privileged_tools = true;
+                    println!("Privileged tool approvals enabled.");
+                    Ok(true)
+                }
+                _ => bail!("usage: /approve <on|off>"),
+            },
+            "/thinking" => match args {
+                "on" => {
+                    self.overlay_set_enabled(true)?;
+                    println!("CLI reasoning overlay enabled.");
+                    Ok(true)
+                }
+                "off" => {
+                    self.overlay_set_enabled(false)?;
+                    println!("CLI reasoning overlay disabled.");
+                    Ok(true)
+                }
+                _ => bail!("usage: /thinking <on|off>"),
+            },
+            "/cancel" => {
+                if self.request_cancel() {
+                    println!("Cancellation requested for current model run.");
+                } else {
+                    println!("No active model run to cancel.");
+                }
                 Ok(true)
             }
             "/route" => {
@@ -526,6 +936,10 @@ impl<M: ModelBackend> Harness<M> {
             }
             "/ws" => {
                 self.handle_websocket_command(args)?;
+                Ok(true)
+            }
+            "/tg" => {
+                self.handle_telegram_command(args)?;
                 Ok(true)
             }
             "/reload-config" => {
@@ -713,6 +1127,103 @@ impl<M: ModelBackend> Harness<M> {
         }
     }
 
+    fn handle_telegram_command(&mut self, args: &str) -> Result<()> {
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let subcommand = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match subcommand {
+            "send" => {
+                let mut inner = rest.splitn(2, char::is_whitespace);
+                let chat_id_raw = inner.next().unwrap_or("").trim();
+                let content = inner.next().unwrap_or("").trim();
+                if chat_id_raw.is_empty() || content.is_empty() {
+                    bail!("usage: /tg send <chat_id> <content>");
+                }
+                let chat_id: i64 = chat_id_raw
+                    .parse()
+                    .map_err(|_| anyhow!("chat_id must be a valid integer"))?;
+                self.event_bus
+                    .publish_inbound(InboundEvent::telegram_message(chat_id, content))?;
+                self.process_inbound_events()?;
+                self.flush_outbound_events()?;
+                self.auto_compact_if_needed();
+                Ok(())
+            }
+            "poll" => {
+                match self.telegram_outbox.pop_front() {
+                    Some(msg) => println!("[tg] {msg}"),
+                    None => println!("[tg] <empty>"),
+                }
+                Ok(())
+            }
+            "bind" => {
+                let mut inner = rest.splitn(2, char::is_whitespace);
+                let chat_id_raw = inner.next().unwrap_or("").trim();
+                let agent_id = inner.next().unwrap_or("").trim();
+                if chat_id_raw.is_empty() || agent_id.is_empty() {
+                    bail!("usage: /tg bind <chat_id> <agent_id>");
+                }
+                let chat_id: i64 = chat_id_raw
+                    .parse()
+                    .map_err(|_| anyhow!("chat_id must be a valid integer"))?;
+                self.event_bus
+                    .upsert_telegram_chat_owner(chat_id, agent_id)?;
+                println!("tg chat owner set: {} -> {}", chat_id, agent_id);
+                Ok(())
+            }
+            "allow" => {
+                let mut inner = rest.splitn(2, char::is_whitespace);
+                let chat_id_raw = inner.next().unwrap_or("").trim();
+                let agent_id = inner.next().unwrap_or("").trim();
+                if chat_id_raw.is_empty() || agent_id.is_empty() {
+                    bail!("usage: /tg allow <chat_id> <agent_id>");
+                }
+                let chat_id: i64 = chat_id_raw
+                    .parse()
+                    .map_err(|_| anyhow!("chat_id must be a valid integer"))?;
+                self.event_bus
+                    .allow_telegram_chat_agent(chat_id, agent_id)?;
+                println!("tg chat ACL allow: {} -> {}", chat_id, agent_id);
+                Ok(())
+            }
+            "acl" => {
+                if rest.is_empty() {
+                    bail!("usage: /tg acl <chat_id>");
+                }
+                let chat_id: i64 = rest
+                    .parse()
+                    .map_err(|_| anyhow!("chat_id must be a valid integer"))?;
+                let owner = self
+                    .event_bus
+                    .telegram_chat_owner(chat_id)?
+                    .unwrap_or_else(|| "<none>".to_string());
+                let acl = self.event_bus.telegram_chat_acl(chat_id)?;
+                if acl.is_empty() {
+                    println!("tg chat {} owner={} acl=<empty>", chat_id, owner);
+                } else {
+                    println!("tg chat {} owner={} acl={}", chat_id, owner, acl.join(","));
+                }
+                Ok(())
+            }
+            "status" => {
+                let snapshot = self.telegram_runtime.policy_snapshot();
+                println!(
+                    "tg policy enabled={} has_bot_token={} api_base_url={} poll_interval_secs={} poll_timeout_secs={} allowed_chat_ids={} outbox_pending={}",
+                    snapshot.enabled,
+                    snapshot.has_bot_token,
+                    snapshot.api_base_url,
+                    snapshot.poll_interval_secs,
+                    snapshot.poll_timeout_secs,
+                    snapshot.allowed_chat_ids_count,
+                    self.telegram_outbox.len()
+                );
+                Ok(())
+            }
+            _ => bail!("usage: /tg <send|poll|bind|allow|acl|status> ..."),
+        }
+    }
+
     fn handle_skills_command(&mut self, args: &str) -> Result<()> {
         match args {
             "reload" => {
@@ -846,7 +1357,7 @@ impl<M: ModelBackend> Harness<M> {
         let content = parts.next().unwrap_or("").trim();
 
         if target.is_empty() || content.is_empty() {
-            bail!("usage: /post <cli|file|websocket> <content>");
+            bail!("usage: /post <cli|file|websocket|telegram> <content>");
         }
 
         let target = parse_delivery_target(target)?;
@@ -1000,6 +1511,8 @@ impl<M: ModelBackend> Harness<M> {
         self.memory_status_snapshot_interval_ticks = cfg.memory_status_snapshot_interval_ticks;
         self.websocket_server
             .reconfigure(websocket_runtime_config_from_harness(&cfg));
+        self.telegram_runtime
+            .reconfigure(telegram_runtime_config_from_harness(&cfg));
 
         let skill_dir = default_skill_dir(&self.tool_ctx.workspace_root, &cfg.skill_dir);
         self.skills = SkillRegistry::load_from_dir(skill_dir)?;
@@ -1095,14 +1608,22 @@ impl<M: ModelBackend> Harness<M> {
 
     fn emit_assistant_output(&mut self, target: DeliveryTarget, content: String) -> Result<()> {
         self.push_message(Role::Assistant, content.clone())?;
-        let event = if target == DeliveryTarget::WebSocket {
-            if let Some(session) = self.active_policy_context.websocket_session_id.clone() {
-                OutboundEvent::with_websocket_session(target, content, session)
-            } else {
-                OutboundEvent::new(target, content)
+        let event = match target {
+            DeliveryTarget::WebSocket => {
+                if let Some(session) = self.active_policy_context.websocket_session_id.clone() {
+                    OutboundEvent::with_websocket_session(target, content, session)
+                } else {
+                    OutboundEvent::new(target, content)
+                }
             }
-        } else {
-            OutboundEvent::new(target, content)
+            DeliveryTarget::Telegram => {
+                if let Some(chat_id) = self.active_policy_context.telegram_chat_id {
+                    OutboundEvent::with_telegram_chat(target, content, chat_id)
+                } else {
+                    OutboundEvent::new(target, content)
+                }
+            }
+            _ => OutboundEvent::new(target, content),
         };
         self.event_bus.publish_outbound(event)?;
         Ok(())
@@ -1145,11 +1666,15 @@ impl<M: ModelBackend> Harness<M> {
                 event.content.as_str(),
                 event.websocket_session_id.as_deref(),
             ),
+            DeliveryTarget::Telegram => {
+                self.deliver_telegram(event.content.as_str(), event.telegram_chat_id)
+            }
         }
     }
 
     fn deliver_cli(&mut self, content: &str) -> Result<()> {
-        println!("{content}");
+        self.overlay_clear()?;
+        println!("{}", render_cli_chat_line("assistant", content));
         Ok(())
     }
 
@@ -1169,6 +1694,14 @@ impl<M: ModelBackend> Harness<M> {
         Ok(())
     }
 
+    fn deliver_telegram(&mut self, content: &str, telegram_chat_id: Option<i64>) -> Result<()> {
+        self.telegram_outbox.push_back(content.to_string());
+        let Some(chat_id) = telegram_chat_id else {
+            bail!("telegram outbound missing chat_id");
+        };
+        self.telegram_runtime.send_message(chat_id, content)
+    }
+
     fn ingest_websocket_inbound_events(&mut self) -> Result<()> {
         for inbound in self.websocket_server.drain_inbound() {
             self.event_bus
@@ -1176,6 +1709,21 @@ impl<M: ModelBackend> Harness<M> {
                     inbound.session_id,
                     inbound.content,
                 ))?;
+        }
+        Ok(())
+    }
+
+    fn ingest_telegram_inbound_events(&mut self) -> Result<()> {
+        let inbound = match self.telegram_runtime.drain_inbound() {
+            Ok(events) => events,
+            Err(err) => {
+                eprintln!("telegram poll failed: {err:#}");
+                return Ok(());
+            }
+        };
+        for event in inbound {
+            self.event_bus
+                .publish_inbound(InboundEvent::telegram_message(event.chat_id, event.content))?;
         }
         Ok(())
     }
@@ -1206,6 +1754,9 @@ impl<M: ModelBackend> Harness<M> {
         println!(
             "  /ws            WebSocket controls (`/ws send <content>`, `/ws broadcast <content>`, `/ws poll`, `/ws clients`, `/ws bind <sid> <agent>`, `/ws allow <sid> <agent>`, `/ws acl <sid>`, `/ws status`, `/ws rotate-token <token>`)."
         );
+        println!(
+            "  /tg            Telegram controls (`/tg send <chat_id> <content>`, `/tg poll`, `/tg bind <chat_id> <agent>`, `/tg allow <chat_id> <agent>`, `/tg acl <chat_id>`, `/tg status`)."
+        );
         println!("  /reload-config Force config reload from .agent/config.json.");
         println!("  /skills        Skill operations (`/skills list`, `/skills reload`).");
         println!("  /policy        Policy operations (`/policy reload`).");
@@ -1219,6 +1770,9 @@ impl<M: ModelBackend> Harness<M> {
         );
         println!("  /approve on    Require approvals for privileged tools.");
         println!("  /approve off   Disable approvals for privileged tools.");
+        println!("  /thinking on   Enable transient CLI thinking overlay.");
+        println!("  /thinking off  Disable transient CLI thinking overlay.");
+        println!("  /cancel        Cancel the currently running model turn.");
         println!("  /exit          Exit.");
         println!("Tool call format: tool:<name> <args>");
     }
@@ -1239,6 +1793,7 @@ fn delivery_target_for_source(source: &EventSource) -> DeliveryTarget {
     match source {
         EventSource::Cli => DeliveryTarget::Cli,
         EventSource::WebSocket => DeliveryTarget::WebSocket,
+        EventSource::Telegram => DeliveryTarget::Telegram,
         EventSource::Scheduler => DeliveryTarget::Cli,
     }
 }
@@ -1247,8 +1802,9 @@ fn parse_event_source(raw: &str) -> Result<EventSource> {
     match raw {
         "cli" => Ok(EventSource::Cli),
         "websocket" | "ws" => Ok(EventSource::WebSocket),
+        "telegram" | "tg" => Ok(EventSource::Telegram),
         "scheduler" => Ok(EventSource::Scheduler),
-        _ => bail!("unsupported source `{raw}` (supported: cli, websocket, scheduler)"),
+        _ => bail!("unsupported source `{raw}` (supported: cli, websocket, telegram, scheduler)"),
     }
 }
 
@@ -1281,12 +1837,24 @@ fn websocket_runtime_config_from_harness(cfg: &HarnessConfig) -> WebSocketRuntim
     }
 }
 
+fn telegram_runtime_config_from_harness(cfg: &HarnessConfig) -> TelegramRuntimeConfig {
+    TelegramRuntimeConfig {
+        enabled: cfg.telegram_enabled,
+        bot_token: cfg.telegram_bot_token.clone(),
+        api_base_url: cfg.telegram_api_base_url.clone(),
+        poll_interval_secs: cfg.telegram_poll_interval_secs,
+        poll_timeout_secs: cfg.telegram_poll_timeout_secs,
+        allowed_chat_ids: cfg.telegram_allowed_chat_ids.clone(),
+    }
+}
+
 fn parse_delivery_target(raw: &str) -> Result<DeliveryTarget> {
     match raw {
         "cli" => Ok(DeliveryTarget::Cli),
         "file" => Ok(DeliveryTarget::File),
         "websocket" | "ws" => Ok(DeliveryTarget::WebSocket),
-        _ => bail!("unsupported target `{raw}` (supported: cli, file, websocket)"),
+        "telegram" | "tg" => Ok(DeliveryTarget::Telegram),
+        _ => bail!("unsupported target `{raw}` (supported: cli, file, websocket, telegram)"),
     }
 }
 
@@ -1294,6 +1862,7 @@ fn source_label(source: &EventSource) -> &'static str {
     match source {
         EventSource::Cli => "cli",
         EventSource::WebSocket => "websocket",
+        EventSource::Telegram => "telegram",
         EventSource::Scheduler => "scheduler",
     }
 }
@@ -1303,7 +1872,48 @@ fn delivery_target_label(target: &DeliveryTarget) -> &'static str {
         DeliveryTarget::Cli => "cli",
         DeliveryTarget::File => "file",
         DeliveryTarget::WebSocket => "websocket",
+        DeliveryTarget::Telegram => "telegram",
     }
+}
+
+fn render_cli_chat_line(role: &str, content: &str) -> String {
+    format!("{role}> {content}")
+}
+
+fn summarize_reasoning_preview(content: &str, max_chars: usize) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut out = String::new();
+    for ch in collapsed.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn format_working_line(elapsed: Duration, tick: usize) -> String {
+    let anim = match tick % 4 {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    };
+    format!("Working{anim} ({}s • esc to interrupt)", elapsed.as_secs())
+}
+
+fn reasoning_line_color_code(index: usize, total: usize) -> &'static str {
+    if total <= 1 {
+        return "97";
+    }
+    if index == 0 {
+        return "90";
+    }
+    if index + 1 == total {
+        return "97";
+    }
+    "37"
 }
 
 fn append_line_jsonl(path: &Path, content: &str) -> Result<()> {
@@ -1328,15 +1938,15 @@ fn resolve_workspace_path(workspace_root: &str, raw: &str) -> PathBuf {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
 
     use super::Harness;
     use crate::agent::events::{DeliveryTarget, DispatchTask, EventSource, InboundEvent};
-    use crate::agent::model::{ModelBackend, ModelOutput};
+    use crate::agent::model::{ModelBackend, ModelResponse, ModelRuntimeEvent};
     use crate::agent::permissions::PermissionPolicy;
     use crate::agent::session::SessionStore;
     use crate::agent::tools::{ToolContext, ToolRegistry, ToolSpec};
@@ -1347,8 +1957,18 @@ mod tests {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     impl ModelBackend for StubModel {
-        fn respond(&self, _history: &[Message], _tools: &[ToolSpec]) -> Result<ModelOutput> {
-            Ok(ModelOutput::Text("ok".to_string()))
+        fn respond(
+            &self,
+            _history: &[Message],
+            _tools: &[ToolSpec],
+            _cancel_requested: &AtomicBool,
+            _on_event: &mut dyn FnMut(ModelRuntimeEvent),
+        ) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                output: crate::agent::model::ModelOutput::Text("ok".to_string()),
+                reasoning_summaries: Vec::new(),
+                usage: None,
+            })
         }
     }
 
@@ -1678,6 +2298,7 @@ mod tests {
                 DeliveryTarget::WebSocket,
                 DispatchTask::new("default", "delegate-agent", "deny me"),
                 Some("session-b".to_string()),
+                None,
             )
             .expect("dispatch should be processed");
 
@@ -1691,6 +2312,100 @@ mod tests {
                 .content
                 .contains("dispatch denied by websocket ACL")
         );
+
+        drop(harness);
+        fs::remove_dir_all(dir).expect("failed to clean temp directory");
+    }
+
+    #[test]
+    fn telegram_gateway_send_routes_and_stores_telegram_outbox_message() {
+        let (mut harness, dir) = harness_for_tests(60);
+
+        let handled = harness
+            .handle_slash("/tg send 10001 hello from telegram")
+            .expect("tg send should succeed");
+        assert!(handled, "tg command should be handled");
+
+        assert_eq!(
+            harness
+                .event_bus
+                .inbound_pending_len()
+                .expect("inbound count should succeed"),
+            0
+        );
+        assert_eq!(harness.event_bus.outbound_pending_len(), 0);
+        assert_eq!(harness.telegram_outbox.len(), 1);
+        assert_eq!(harness.telegram_outbox.front(), Some(&"ok".to_string()));
+
+        drop(harness);
+        fs::remove_dir_all(dir).expect("failed to clean temp directory");
+    }
+
+    #[test]
+    fn telegram_chat_route_is_sticky_after_source_route_change() {
+        let (mut harness, dir) = harness_for_tests(60);
+        harness.register_agent_handler("support-agent", |harness, target, task| {
+            harness.emit_assistant_output(target, format!("support: {}", task.content))
+        });
+        harness.set_source_route(&EventSource::Telegram, "support-agent");
+
+        harness
+            .event_bus
+            .publish_inbound(InboundEvent::telegram_message(22001, "first"))
+            .expect("publish first telegram event should succeed");
+        harness
+            .process_inbound_events()
+            .expect("first telegram event should process");
+
+        harness.set_source_route(&EventSource::Telegram, "default");
+        harness
+            .event_bus
+            .publish_inbound(InboundEvent::telegram_message(22001, "second"))
+            .expect("publish second telegram event should succeed");
+        harness
+            .process_inbound_events()
+            .expect("second telegram event should process");
+
+        let first = harness
+            .event_bus
+            .pop_outbound()
+            .expect("first outbound pop should succeed")
+            .expect("first outbound should exist");
+        let second = harness
+            .event_bus
+            .pop_outbound()
+            .expect("second outbound pop should succeed")
+            .expect("second outbound should exist");
+        assert_eq!(first.content, "support: first");
+        assert_eq!(second.content, "support: second");
+
+        drop(harness);
+        fs::remove_dir_all(dir).expect("failed to clean temp directory");
+    }
+
+    #[test]
+    fn telegram_acl_denies_dispatch_to_unapproved_agent() {
+        let (mut harness, dir) = harness_for_tests(60);
+        harness
+            .event_bus
+            .upsert_telegram_chat_owner(33001, "default")
+            .expect("owner setup should succeed");
+        harness
+            .dispatch_task(
+                &EventSource::Telegram,
+                DeliveryTarget::Telegram,
+                DispatchTask::new("default", "delegate-agent", "deny me"),
+                None,
+                Some(33001),
+            )
+            .expect("dispatch should be processed");
+
+        let outbound = harness
+            .event_bus
+            .pop_outbound()
+            .expect("outbound pop should succeed")
+            .expect("outbound should exist");
+        assert!(outbound.content.contains("dispatch denied by telegram ACL"));
 
         drop(harness);
         fs::remove_dir_all(dir).expect("failed to clean temp directory");
@@ -1982,5 +2697,61 @@ mod tests {
 
         drop(harness);
         fs::remove_dir_all(dir).expect("failed to clean temp directory");
+    }
+
+    #[test]
+    fn render_cli_chat_line_formats_user_role() {
+        let rendered = super::render_cli_chat_line("user", "hello");
+        assert_eq!(rendered, "user> hello");
+    }
+
+    #[test]
+    fn render_cli_chat_line_formats_assistant_role() {
+        let rendered = super::render_cli_chat_line("assistant", "how can I help?");
+        assert_eq!(rendered, "assistant> how can I help?");
+    }
+
+    #[test]
+    fn reasoning_overlay_keeps_latest_lines_with_configured_capacity() {
+        let mut overlay = super::CliReasoningOverlay {
+            enabled: true,
+            is_tty: false,
+            max_lines: 3,
+            rendered_lines: 0,
+            lines: std::collections::VecDeque::new(),
+            working_elapsed: None,
+            working_tick: 0,
+        };
+        overlay
+            .push("one")
+            .expect("push should succeed when tty rendering is disabled");
+        overlay
+            .push("two")
+            .expect("push should succeed when tty rendering is disabled");
+        overlay
+            .push("three")
+            .expect("push should succeed when tty rendering is disabled");
+        overlay
+            .push("four")
+            .expect("push should succeed when tty rendering is disabled");
+
+        let lines: Vec<&str> = overlay.lines.iter().map(|s| s.as_str()).collect();
+        assert_eq!(lines, vec!["two", "three", "four"]);
+    }
+
+    #[test]
+    fn reasoning_line_color_code_fades_top_and_highlights_bottom() {
+        assert_eq!(super::reasoning_line_color_code(0, 4), "90");
+        assert_eq!(super::reasoning_line_color_code(1, 4), "37");
+        assert_eq!(super::reasoning_line_color_code(3, 4), "97");
+    }
+
+    #[test]
+    fn format_working_line_reports_seconds_and_animation() {
+        let line0 = super::format_working_line(Duration::from_secs(57), 0);
+        let line3 = super::format_working_line(Duration::from_secs(57), 3);
+
+        assert_eq!(line0, "Working (57s • esc to interrupt)");
+        assert_eq!(line3, "Working... (57s • esc to interrupt)");
     }
 }

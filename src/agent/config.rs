@@ -23,6 +23,12 @@ pub struct HarnessConfig {
     pub websocket_max_clients: usize,
     pub websocket_idle_timeout_secs: u64,
     pub websocket_ping_interval_secs: u64,
+    pub telegram_enabled: bool,
+    pub telegram_bot_token: String,
+    pub telegram_api_base_url: String,
+    pub telegram_poll_interval_secs: u64,
+    pub telegram_poll_timeout_secs: u64,
+    pub telegram_allowed_chat_ids: Vec<i64>,
     pub memory_retention_ttl_days: i64,
     pub memory_retention_max_records: usize,
     pub memory_search_mode: String,
@@ -63,6 +69,12 @@ impl Default for HarnessConfig {
             websocket_max_clients: 128,
             websocket_idle_timeout_secs: 300,
             websocket_ping_interval_secs: 30,
+            telegram_enabled: false,
+            telegram_bot_token: "".to_string(),
+            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_poll_interval_secs: 2,
+            telegram_poll_timeout_secs: 0,
+            telegram_allowed_chat_ids: Vec::new(),
             memory_retention_ttl_days: 30,
             memory_retention_max_records: 2000,
             memory_search_mode: "hybrid".to_string(),
@@ -225,6 +237,11 @@ mod tests {
         assert_eq!(cfg.memory_retention_max_records, 2000);
         assert_eq!(cfg.websocket_idle_timeout_secs, 300);
         assert_eq!(cfg.websocket_ping_interval_secs, 30);
+        assert!(!cfg.telegram_enabled);
+        assert_eq!(cfg.telegram_api_base_url, "https://api.telegram.org");
+        assert_eq!(cfg.telegram_poll_interval_secs, 2);
+        assert_eq!(cfg.telegram_poll_timeout_secs, 0);
+        assert!(cfg.telegram_allowed_chat_ids.is_empty());
         assert_eq!(cfg.memory_search_mode, "hybrid");
         assert!((cfg.memory_hybrid_lexical_weight - 0.6).abs() < f64::EPSILON);
         assert!((cfg.memory_hybrid_semantic_weight - 0.4).abs() < f64::EPSILON);

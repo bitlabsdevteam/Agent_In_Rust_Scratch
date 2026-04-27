@@ -40,6 +40,7 @@ impl SourceKey for EventSource {
         match self {
             EventSource::Cli => "cli",
             EventSource::WebSocket => "websocket",
+            EventSource::Telegram => "telegram",
             EventSource::Scheduler => "scheduler",
         }
     }
